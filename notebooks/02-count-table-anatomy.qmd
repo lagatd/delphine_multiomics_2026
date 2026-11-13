@@ -64,6 +64,39 @@ saying which. Columns: library size, number of features detected, fraction of
 zeros, the share held by the largest feature, Shannon diversity, and the
 effective number of features.*
 
+```{r step-1-stats}
+# One row per sample for each table, with per-sample summary numbers.
+
+# Numbers for a single sample: counts is one column of the table.
+summarise_sample <- function(counts) {
+  total   <- sum(counts)                    # library size
+  p       <- counts[counts > 0] / total     # shares of nonzero features
+  shannon <- -sum(p * log(p))               # natural log, R's default
+  tibble(
+    library_size       = total,
+    features_detected  = sum(counts > 0),
+    fraction_zeros     = mean(counts == 0),
+    max_feature_share  = max(counts) / total,
+    shannon            = shannon,
+    effective_features = exp(shannon)       # e^Shannon: "like how many
+  )                                          # equally abundant features"
+}
+
+# All samples of one table: applies the function to every sample column.
+one_table <- function(counts, name) {
+  mat <- as.matrix(counts[, -1])            # drop the id column, keep samples
+  tibble(table = name, sample_id = colnames(mat)) |>
+    bind_cols(map_dfr(as.data.frame(mat), summarise_sample))
+}
+
+sample_stats <- bind_rows(
+  one_table(species, "species"),
+  one_table(genes,   "genes")
+)
+
+sample_stats
+```
+
 - Does it have 942 rows, 471 for each table?
   - *Your answer:*
 - Type `sum(species$P001_week_18)` in the console. Does it match Pi's library size for that sample?

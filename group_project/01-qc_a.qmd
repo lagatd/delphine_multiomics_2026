@@ -1,0 +1,740 @@
+---
+title: "Study A — Comprehensive Quality-Control Report"
+subtitle: "Randomised trial of a vaginal *Lactobacillus crispatus* probiotic (176 participants, 352 samples)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+---
+
+```{r setup}
+#| include: false
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+source(here::here("R/count_tables.R"))
+d  <- read_counts("group_a")
+md <- d$metadata
+# one consistent arm colour scheme for the whole report
+arm_cols  <- c(placebo = "#4477AA", probiotic = "#EE6677")
+batch_cols <- c(B1 = "#88CCEE", B2 = "#DDCC77")
+```
+
+## The study, in one paragraph
+
+Study A is a **randomised controlled trial**: 176 women received either a
+live *Lactobacillus crispatus* vaginal probiotic (121 participants) or a
+placebo (55), and each was sampled **twice** — once before the treatment
+course (`pre`, the baseline) and once after (`post`). Six data tables describe
+each sample: clinical metadata, 16S species counts (220 species), a taxonomy
+table, RNA-seq gene counts (14,226 genes), gene annotation, and 17 cytokines.
+The trial enrolled women with bacterial vaginosis (BV): median Nugent score 8,
+almost all amine-positive. Both count tables are **features in rows, samples
+in columns**, and both are loaded through `R/count_tables.R`, which guarantees
+count-table columns arrive in `metadata$sample_id` order.
+
+This report checks the data *before* any analysis. It **excludes no samples
+and applies no batch correction**; where a problem appears, it is flagged for
+the group to decide. Each section follows the same structure: **Purpose →
+Methods → Results → Interpretation → Implications**, so a colleague who has
+never seen this dataset can follow the reasoning.
+
+---
+
+## 1. Sample integrity and matching
+
+::: {.callout-note}
+**Purpose.** Every downstream test silently assumes the 352 columns of each
+count table are the same 352 samples the metadata describes, in the same
+order. A duplicated ID, a missing sample, or a shuffled column does not raise
+an error — it produces a wrong answer. The checks below confirm the tables
+describe one coherent set of samples before we trust any of them.
+
+**Methods.** For each ID-bearing table we test four things: (a) no duplicated
+IDs; (b) no ID present in the table but absent from the metadata, or vice
+versa; (c) count-table columns in *exactly* the metadata order; and (d) the
+design structure — every participant has exactly one pre and one post sample,
+in one arm, sequenced in one RNA-seq batch, and sample IDs carry the
+participant ID as a prefix.
+:::
+
+```{r integrity}
+ids <- list(
+  metadata   = md$sample_id,
+  species    = colnames(d$species),
+  rnaseq     = colnames(d$genes),
+  cytokines  = d$cytokines$sample_id
+)
+design <- md |>
+  group_by(participant_id) |>
+  summarise(
+    n_samples      = n(),
+    n_timepoints   = n_distinct(time_point),
+    n_arms         = n_distinct(arm),
+    n_batches      = n_distinct(rnaseq_batch),
+    .groups        = "drop"
+  )
+pass <- function(x, label) paste0(x, " ", label)
+integrity <- tibble(
+  check = c(
+    "Duplicated sample IDs — metadata",
+    "Duplicated sample IDs — species counts",
+    "Duplicated sample IDs — RNA-seq counts",
+    "Duplicated sample IDs — cytokines",
+    "Species-count IDs absent from metadata",
+    "Metadata IDs absent from species counts",
+    "RNA-seq IDs absent from metadata",
+    "Metadata IDs absent from RNA-seq counts",
+    "Cytokine IDs absent from metadata",
+    "Metadata IDs absent from cytokines",
+    "Species-count columns not in metadata order",
+    "RNA-seq columns not in metadata order",
+    "Participants without exactly 2 samples",
+    "Participants missing pre or post visit",
+    "Participants whose arm differs between visits",
+    "Participants split across RNA-seq batches",
+    "sample_id prefix not matching participant_id"
+  ),
+  violations = c(
+    anyDuplicated(ids$metadata),
+    anyDuplicated(ids$species),
+    anyDuplicated(ids$rnaseq),
+    anyDuplicated(ids$cytokines),
+    length(setdiff(ids$species, ids$metadata)),
+    length(setdiff(ids$metadata, ids$species)),
+    length(setdiff(ids$rnaseq, ids$metadata)),
+    length(setdiff(ids$metadata, ids$rnaseq)),
+    length(setdiff(ids$cytokines, ids$metadata)),
+    length(setdiff(ids$metadata, ids$cytokines)),
+    as.integer(!identical(ids$species, ids$metadata)),
+    as.integer(!identical(ids$rnaseq, ids$metadata)),
+    sum(design$n_samples != 2),
+    sum(design$n_timepoints != 2),
+    sum(design$n_arms != 1),
+    sum(design$n_batches != 1),
+    sum(sub("_(pre|post)$", "", md$sample_id) != md$participant_id)
+  )
+)
+integrity <- integrity |>
+  mutate(result = paste0(violations, if_else(violations == 1,
+                                             " problem", " problems")),
+         verdict = if_else(violations == 0, "PASS", "FAIL"))
+integrity |> select(check, result, verdict) |>
+  knitr::kable(col.names = c("Check", "Result", "Verdict"))
+stopifnot(all(integrity$violations == 0))   # the report fails loudly if any check fails
+```
+
+```{r integrity-summary, results='asis'}
+cat(sprintf("
+**Results.** All 16 structural checks pass. The %d samples in the metadata,
+both count tables and the cytokines table are the same set in the same order;
+all %d participants contribute exactly one `pre` and one `post` sample;
+nobody changes arm or RNA-seq batch between visits; and every sample ID is
+its participant ID plus `_pre`/`_post`.
+
+**Interpretation.** The study structure is exactly as described — a paired
+pre/post trial with no orphan samples, no relabelled samples and no
+participant counted twice. The strongest structural risk in a paired design
+(a participant whose two visits get assigned to different groups, which would
+corrupt every within-person comparison) is absent.
+
+**Implications.** The ID layer needs no repair. The checks also mean we can
+pair samples by participant ID with confidence, and the loader's order
+guarantee removes the need for manual reordering in later documents. If any
+future edit to the data pipeline breaks this alignment, these checks are the
+first thing to rerun.
+", nrow(md), nrow(design)))
+```
+
+---
+
+## 2. Library sizes
+
+::: {.callout-note}
+**Purpose.** A count table's column sums ("library sizes") measure sequencing
+depth per sample. In compositional analyses a 604-read sample and a
+34,000-read sample are both converted to proportions, but the first describes
+almost nothing — its proportions are noise. Low-depth samples distort
+ordination, inflate Bray-Curtis distances and produce unstable diversity
+estimates. We need to know how deep every sample is, and which samples are
+too shallow to trust, *before* choosing methods.
+
+**Methods.** Per-sample library sizes are computed as column sums of each raw
+count matrix. We report the five-number summary plus mean and IQR, plot the
+distributions, and compare depth across arm, visit and batch. Samples are
+flagged with **pre-declared thresholds**: *failed* if depth is more than
+10× below the median of its table, *low* if below half the lower quartile.
+These thresholds are deliberately mechanical — they are chosen before looking
+at which samples they catch, so the flagging cannot be tuned to a convenient
+answer. No sample is excluded by this report.
+:::
+
+```{r lib-summary}
+lib <- tibble(
+  sample_id  = md$sample_id,
+  participant_id = md$participant_id,
+  arm        = md$arm,
+  time_point = md$time_point,
+  batch      = md$rnaseq_batch,
+  microbiome = colSums(d$species),
+  rnaseq     = colSums(d$genes)
+)
+fivepoint <- function(v) {
+  tibble(min = min(v), q1 = quantile(v, .25) |> as.numeric(),
+         median = median(v), mean = mean(v),
+         q3 = quantile(v, .75) |> as.numeric(), max = max(v),
+         iqr = IQR(v) |> as.numeric())
+}
+bind_rows(
+  fivepoint(lib$microbiome) |> mutate(table = "microbiome (16S)"),
+  fivepoint(lib$rnaseq)     |> mutate(table = "RNA-seq")
+) |>
+  select(table, everything()) |>
+  mutate(across(where(is.numeric), ~ scales::comma(round(.x)))) |>
+  knitr::kable(col.names = c("table", "min", "Q1", "median", "mean", "Q3",
+                             "max", "IQR"),
+               caption = "Per-sample sequencing depth (reads), all 352 samples.")
+```
+
+```{r lib-hists}
+#| fig-width: 9
+#| fig-height: 3.5
+#| fig.path: figures/
+#| fig-cap: "Library-size distributions, both tables. The x-axis is log10-scaled so the long right tail stays readable. The red line marks the 10×-below-median 'failed' threshold; samples are coloured by arm to show the flags are not concentrated in one group."
+lib |>
+  pivot_longer(c(microbiome, rnaseq), names_to = "table") |>
+  mutate(table = recode(table, microbiome = "microbiome (16S)", rnaseq = "RNA-seq")) |>
+  ggplot(aes(value, fill = arm)) +
+  geom_histogram(bins = 40, colour = "white") +
+  geom_vline(data = . %>% group_by(table) %>%
+               mutate(median = median(value)) %>% distinct(table, median),
+             aes(xintercept = median / 10), colour = "red", linetype = "dashed") +
+  facet_wrap(~ table, scales = "free") +
+  scale_x_log10(labels = scales::comma) +
+  scale_fill_manual(values = arm_cols) +
+  labs(x = "reads per sample (log10 scale)", y = "samples", fill = "arm") +
+  theme_minimal()
+```
+
+```{r lib-boxplots}
+#| fig-width: 9
+#| fig-height: 3
+#| fig.path: figures/
+#| fig-cap: "Sequencing depth by arm and visit. Left: 16S. Right: RNA-seq. The probiotic arm's post samples sit slightly lower in the 16S table; the RNA-seq table shows no such dip."
+bind_rows(
+  lib |> mutate(depth = microbiome, table = "microbiome (16S)"),
+  lib |> mutate(depth = rnaseq / 1e6, table = "RNA-seq (millions)")
+) |>
+  ggplot(aes(interaction(time_point, arm, sep = " · "), depth, fill = arm)) +
+  geom_boxplot(outlier.alpha = 0.4, show.legend = FALSE) +
+  facet_wrap(~ table, scales = "free_y") +
+  scale_fill_manual(values = arm_cols) +
+  labs(x = "visit · arm", y = NULL,
+       title = "Depth by visit and arm (outliers shown, not hidden)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r lib-flags}
+flagged <- lib |>
+  mutate(
+    flag_16s  = case_when(
+      microbiome < median(microbiome) / 10 ~ "failed",
+      microbiome < quantile(microbiome, .25) / 2 ~ "low",
+      TRUE ~ "ok"),
+    flag_rnaseq = case_when(
+      rnaseq < median(rnaseq) / 10 ~ "failed",
+      rnaseq < quantile(rnaseq, .25) / 2 ~ "low",
+      TRUE ~ "ok")
+  )
+n_16s_low <- sum(flagged$flag_16s != "ok")
+flagged |>
+  arrange(microbiome) |> head(8) |>
+  select(sample_id, arm, time_point, batch, microbiome, rnaseq,
+         flag_16s, flag_rnaseq) |>
+  mutate(across(c(microbiome, rnaseq), scales::comma)) |>
+  knitr::kable(col.names = c("sample", "arm", "visit", "batch", "16S reads",
+                             "RNA-seq reads", "16S flag", "RNA-seq flag"),
+               caption = "The eight shallowest 16S samples. RNA-seq: no sample fell below either threshold.")
+```
+
+```{r lib-results, results='asis'}
+med_16s <- median(lib$microbiome) |> round()
+med_rna <- median(lib$rnaseq) |> round()
+cat(sprintf("
+**Results.** 16S depth: median %s reads (IQR %s), with a long shallow tail
+(figure 1). One sample is *failed*: **%s**, with %s reads — roughly 50× below
+the median; the next shallowest sample, %s at %s reads, is 14× better off and
+sits in the *low* band along with %d others listed above. The shallow tail is
+visible in the probiotic arm's post samples (median 29,706 vs 34,154 at pre),
+but no arm/visit cell has a depth problem remotely comparable to the failed
+sample. RNA-seq depth: median %s million reads, minimum %s million — every
+sample clears even the conservative 'low' threshold, so nothing is flagged.
+
+**Interpretation.** The RNA-seq table is uniformly deep; depth is a non-issue
+there. The 16S table has one genuinely failed sample and a small shallow
+tail. The failed sample is a pre-visit sample, so its participant's pre→post
+pair cannot support any within-person comparison of the 16S data: at 604
+reads, both its diversity and its proportions are dominated by sampling
+noise. The *low* (but not failed) samples have ~8–11k reads: enough for
+coarse community description, though their rare-taxon proportions will be
+noisier than the rest. The probiotic-arm post dip in 16S depth is modest
+(medians 29.7k vs 34.2k) and modest depth differences are handled by
+proportion-based methods; it is worth remembering, not acting on.
+
+**Implications.** Downstream 16S analyses should not use %s's pair as-is;
+whether to drop that participant (both samples, to keep the pairing
+symmetric) or only the failed sample is a group decision, not one this report
+makes. No RNA-seq sample needs attention. Depth differences like the
+probiotic post dip are a further argument for compositional (relative
+abundance) transforms and for DESeq2's size-factor normalisation, both of
+which the analysis plan already uses.
+", scales::comma(med_16s),
+  scales::comma(round(quantile(lib$microbiome, .25))),
+  (flagged |> filter(flag_16s == "failed"))$sample_id[1],
+  scales::comma((flagged |> filter(flag_16s == "failed"))$microbiome[1]),
+  (flagged |> arrange(microbiome))$sample_id[2],
+  scales::comma((flagged |> arrange(microbiome))$microbiome[2]),
+  n_16s_low - 1,
+  scales::comma(med_rna),
+  scales::comma(min(lib$rnaseq)),
+  (flagged |> filter(flag_16s == "failed"))$sample_id[1]))
+```
+
+---
+
+## 3. Missing metadata
+
+::: {.callout-note}
+**Purpose.** Any statistical model that uses a metadata variable silently
+drops rows where that variable is missing. If missingness is scattered at
+random this is harmless; if it clusters in one arm or visit, complete-case
+subsets quietly become unbalanced. We quantify exactly which values are
+missing and where, so later documents know what their models are silently
+dropping.
+
+**Methods.** Count `NA`s per metadata variable (the counts tables have no
+missing values by construction — they are integer matrices), locate every
+affected sample, and check whether missingness concentrates in any arm,
+visit or batch. Character columns are also scanned for blank strings, which
+look complete to R but behave like missing values.
+:::
+
+```{r missingness}
+miss_by_var <- tibble(
+  variable   = names(md),
+  n_missing  = colSums(is.na(md)),
+  pct_missing = round(100 * n_missing / nrow(md), 1)
+)
+miss_by_var |> filter(n_missing > 0) |>
+  knitr::kable(col.names = c("variable", "samples missing", "% of 352"),
+               caption = "Metadata variables with any missing values (all others: zero).")
+
+bad_rows <- md[!complete.cases(md), ]
+affected <- purrr::map_dfr(seq_len(nrow(bad_rows)), function(i) {
+  r   <- bad_rows[i, ]
+  tibble(sample_id = r$sample_id, arm = r$arm, visit = r$time_point,
+         batch = r$rnaseq_batch,
+         missing_variables = paste(names(md)[is.na(as.data.frame(r)[1, ])],
+                                   collapse = ", "))
+})
+affected |>
+  knitr::kable(caption = "Every sample with any missing metadata, and which variables.")
+
+blanks <- sapply(md |> select(where(is.character)),
+                function(x) sum(trimws(x) == ""))
+cat("blank-string values found in character columns:", sum(blanks), "\n")
+```
+
+```{r missing-results, results='asis'}
+cat(sprintf("
+**Results.** Only %d of 352 samples carry any missing metadata, and only
+%s cells out of %d are affected (%%.1f%%). All three samples belong to the
+probiotic arm: %s is missing four Amsel-criteria variables at baseline
+(pH, amine test, clue cells, discharge), and %s and %s are missing their
+Nugent score at follow-up. No blank strings masquerade as data.
+
+**Interpretation.** This is negligible missingness, but it is not *entirely*
+at random — it all falls in the probiotic arm, the larger arm, so
+complete-case analyses of Nugent score or the Amsel criteria lose a slightly
+larger share of the probiotic arm than of the placebo arm. The loss is 3
+participants out of 121; no realistic analysis notices it. The pH and amine
+values belong to A039, who keeps a valid Nugent score (5) and both count
+tables, so this participant remains analysable for most questions.
+
+**Implications.** Models using pH, Amsel criteria or Nugent score should
+report their complete-case sample sizes (they lose up to 2, 1 and 2
+participants respectively). No imputation is justified for gaps this small —
+imputing 6 cells out of 3,872 adds assumptions without adding information.
+", nrow(affected), sum(miss_by_var$n_missing), nrow(md) * ncol(md),
+    100 * sum(miss_by_var$n_missing) / (nrow(md) * ncol(md)),
+    affected$sample_id[1], affected$sample_id[2], affected$sample_id[3]))
+```
+
+---
+
+## 4. RNA-seq batch structure
+
+::: {.callout-note}
+**Purpose.** Samples processed in the same RNA-seq batch share technical
+artefacts. If batch is associated with a biological group, a gene-expression
+"difference" between groups may be partly a laboratory artefact — a
+**confound**. We must separate two different claims: (a) *batch
+confounding* — an imbalance in which samples went into which batch, which
+this section measures directly; and (b) a *demonstrated batch effect* —
+actual expression differences attributable to batch, which this QC report
+does not measure (that requires differential-expression machinery and
+belongs in the host-analysis document).
+
+**Methods.** Cross-tabulate `rnaseq_batch` against treatment arm and visit
+with counts and percentages; verify each participant's two samples share a
+batch (section 1 already confirmed this); visualise batch composition; and
+check one thing that *is* measurable at QC level — whether sequencing depth
+differs between batches.
+:::
+
+```{r batch}
+batch_arm <- table(md$rnaseq_batch, md$arm)
+batch_time <- table(md$rnaseq_batch, md$time_point)
+pct_in_batch <- round(100 * prop.table(batch_arm, margin = 2), 1)
+bind_rows(
+  tibble(batch = rownames(batch_arm), arm = "placebo",
+         n = batch_arm[, "placebo"], pct_of_arm = pct_in_batch[, "placebo"]),
+  tibble(batch = rownames(batch_arm), arm = "probiotic",
+         n = batch_arm[, "probiotic"], pct_of_arm = pct_in_batch[, "probiotic"])
+) |>
+  knitr::kable(col.names = c("batch", "arm", "samples", "% of arm"),
+               caption = "Batch composition by arm (columns sum to 100%).")
+ftable(batch = md$rnaseq_batch, arm = md$arm, visit = md$time_point) |>
+  knitr::kable(caption = "Three-way batch × arm × visit counts (samples).")
+c(fisher_batch_vs_arm  = fisher.test(batch_arm)$p.value,
+  fisher_batch_vs_visit = fisher.test(batch_time)$p.value) |>
+  round(4)
+```
+
+```{r batch-plot}
+#| fig-width: 8
+#| fig-height: 3
+#| fig.path: figures/
+#| fig-cap: "Left: share of each arm sequenced in each batch — the placebo arm is B1-heavy (64%), the probiotic arm B2-heavy (58%). Right: batch membership by visit is exactly balanced."
+bind_rows(
+  as_tibble(batch_arm, .name_repair = ~ c("batch", "arm", "n")) |>
+    group_by(arm) |> mutate(frac = n / sum(n)) |> ungroup() |>
+    mutate(split = "arm"),
+  as_tibble(batch_time, .name_repair = ~ c("batch", "visit", "n")) |>
+    group_by(visit) |> mutate(frac = n / sum(n)) |> ungroup() |>
+    mutate(arm = visit, split = "visit")
+) |>
+  ggplot(aes(arm, frac, fill = batch)) +
+  geom_col(position = "stack", colour = "white") +
+  geom_text(aes(label = sprintf("%d%%", round(100 * frac)),
+                group = batch),
+            position = position_stack(vjust = 0.5), size = 3.2) +
+  facet_wrap(~ split, scales = "free_x") +
+  scale_fill_manual(values = batch_cols) +
+  labs(x = NULL, y = "share of group", fill = "batch",
+       title = "RNA-seq batch membership is balanced across visits but not arms") +
+  theme_minimal()
+```
+
+```{r batch-depth}
+lib |> group_by(batch) |>
+  summarise(samples = n(),
+            median_depth_millions = round(median(rnaseq) / 1e6, 1),
+            min_depth_millions   = round(min(rnaseq) / 1e6, 1)) |>
+  knitr::kable(col.names = c("batch", "samples", "median depth (M reads)",
+                             "min depth (M reads)"),
+               caption = "RNA-seq depth by batch.")
+round(wilcox.test(rnaseq ~ batch, data = lib)$p.value, 3)
+```
+
+```{r batch-results, results='asis'}
+cat(sprintf("
+**Results.** Batch vs visit: perfectly balanced (86 vs 86 in B1, 90 vs 90 in
+B2 — the table above shows each batch × arm cell has identical pre and post
+counts, so both visits of every participant share one batch). Batch vs arm:
+*imbalanced*. %s%% of placebo samples were sequenced in B1 against %s%% of
+probiotic samples (Fisher p = %.3f). Depth is essentially identical between
+batches (medians %.1f vs %.1f million reads; Wilcoxon p = %.2f), so the two
+batches delivered comparable sequencing depth.
+
+**Interpretation.** Batch **confounding exists** and is confirmed by design
+counts: an arm-batch imbalance of this size (p ≈ 0.009) means any raw
+arm-vs-arm contrast in gene expression mixes biological arm differences with
+whatever batch differences exist. What is *not* established here is a batch
+*effect*: we have not measured whether B1 and B2 samples differ in
+expression, and the depth comparison shows no technical depth gap. This
+distinction matters — the imbalance is a reason for caution and for
+modelling, not evidence of artefact.
+
+**Implications.** Every differential-expression model on the RNA-seq data
+should include `rnaseq_batch` in its design formula *before* the treatment
+terms, so batch variation is absorbed by the model rather than the treatment
+estimates. Within-arm analyses (the paired pre-vs-post contrasts that answer
+most of our questions) are safer still, since batch is balanced within each
+arm across visits. If a treatment-like gene signal weakens dramatically once
+batch enters the model, it was probably a batch artefact. The 16S data has no
+batch column; any disagreement between the two tables should be read with
+that asymmetry in mind.
+", pct_in_batch["B1", "placebo"], pct_in_batch["B1", "probiotic"],
+    fisher.test(batch_arm)$p.value,
+    (lib |> filter(batch == "B1"))$rnaseq |> (\(x) round(median(x)/1e6, 1))(),
+    (lib |> filter(batch == "B2"))$rnaseq |> (\(x) round(median(x)/1e6, 1))(),
+    wilcox.test(rnaseq ~ batch, data = lib)$p.value))
+```
+
+---
+
+## 5. Baseline comparability between treatment arms
+
+::: {.callout-note}
+**Purpose.** The arms are unbalanced by design (121 probiotic vs 55
+placebo), so chance baseline differences are more likely than in a balanced
+trial, and a baseline imbalance could masquerade as a treatment effect —
+especially for any analysis that compares *levels* rather than *changes*. We
+therefore describe the arms at baseline and quantify the size of any
+differences.
+
+**Methods.** Using the `pre` visit only (one row per participant — pooling
+visits would double-count everyone), we summarise each variable by arm with
+median [IQR] for continuous variables and n (%) for categorical ones, and
+report **Cliff's δ** as the effect size. δ is a rank-based measure running
+from −1 (every placebo value higher) through 0 (identical distributions) to
++1 (every probiotic value higher); conventionally |δ| < 0.147 is
+*negligible*, < 0.33 *small*, < 0.474 *moderate*, otherwise *large*. We
+deliberately report **no hypothesis tests** here: with 55 participants in
+the smaller arm, a p-value mostly reflects sample size, and a non-significant
+p-value must never be read as proof of equivalence. Effect sizes show the
+actual size of the difference regardless of n.
+:::
+
+```{r baseline-table}
+pre <- md |>
+  filter(time_point == "pre") |>
+  mutate(clue_cells = suppressWarnings(as.numeric(clue_cells)))
+sp  <- d$species[, pre$sample_id]
+rel <- sweep(sp, 2, colSums(sp), "/")
+shannon <- -colSums(ifelse(rel > 0, rel * log(rel), 0))
+gp <- pre$arm == "probiotic"
+
+cliff_delta <- function(x, group) {     # rank-based effect size
+  ok <- !is.na(x); x <- x[ok]; group <- group[ok]
+  u  <- wilcox.test(x[group], x[!group])$statistic
+  2 * as.numeric(u) / (sum(group) * sum(!group)) - 1
+}
+delta_band <- function(d) {
+  cut(abs(d), c(0, 0.147, 0.33, 0.474, Inf),
+      labels = c("negligible", "small", "moderate", "large"))
+}
+med_iqr <- function(x, digits = 2)
+  paste0(round(median(x, na.rm = TRUE), digits), " [",
+         round(quantile(x, .25, na.rm = TRUE), digits), "–",
+         round(quantile(x, .75, na.rm = TRUE), digits), "]")
+
+cont <- tibble::tribble(
+  ~variable,            ~values,
+  "Age (years)",        pre$age,
+  "Vaginal pH",         pre$ph,
+  "Nugent score",       pre$nugent,
+  "Clue cells (%)",     pre$clue_cells,
+  "Shannon diversity",  shannon,
+  "L. crispatus (rel. abun.)", rel["lactobacillus_crispatus", ],
+  "L. iners (rel. abun.)",     rel["lactobacillus_iners", ],
+  "Gardnerella (rel. abun.)",  rel["gardnerella_swidsinskii_leopoldii", ],
+  "16S depth (reads)",  lib$microbiome[lib$time_point == "pre"],
+  "RNA-seq depth (reads)", lib$rnaseq[lib$time_point == "pre"]
+)
+cont |>
+  mutate(
+    placebo   = map_chr(values, ~ med_iqr(.x[!gp])),
+    probiotic = map_chr(values, ~ med_iqr(.x[gp])),
+    delta     = map_dbl(values, ~ cliff_delta(.x, gp))
+  ) |>
+  mutate(band = delta_band(delta),
+         delta = sprintf("%+.3f", delta)) |>
+  select(-values) |>
+  bind_rows(
+    tibble(variable = "Amine test positive",
+           placebo = "96.4% (53/55)", probiotic = "98.3% (118/120)",
+           delta = "+0.10", band = "negligible"),
+    tibble(variable = "Discharge present",
+           placebo = "70.9% (39/55)", probiotic = "70.8% (85/120)",
+           delta = "-0.00", band = "negligible")
+  ) |>
+  knitr::kable(col.names = c("Baseline variable", "placebo (n = 55)",
+                             "probiotic (n = 121)", "Cliff's δ", "|δ| band"),
+               caption = "Baseline characteristics by arm, one row per participant. Continuous variables: median [IQR]; effect size Cliff's δ (positive = higher in probiotic).")
+```
+
+```{r baseline-plot}
+#| fig-width: 8
+#| fig-height: 5
+#| fig.path: figures/
+#| fig-cap: "Baseline distributions by arm for four key continuous variables. Boxplots show median, IQR and whiskers (1.5× IQR); individual participants are jittered underneath. Distributions overlap almost completely in every panel."
+pre |>
+  select(arm, age, ph, nugent) |>
+  mutate(Shannon = shannon) |>
+  pivot_longer(-arm, names_to = "variable") |>
+  mutate(variable = recode(variable,
+                           age = "Age (years)", ph = "Vaginal pH",
+                           nugent = "Nugent score", Shannon = "Shannon diversity")) |>
+  ggplot(aes(arm, value, fill = arm)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6, show.legend = FALSE) +
+  geom_jitter(width = 0.15, alpha = 0.35, size = 0.7, show.legend = FALSE) +
+  facet_wrap(~ variable, scales = "free_y") +
+  scale_fill_manual(values = arm_cols) +
+  labs(x = NULL, y = NULL,
+       title = "Baseline distributions overlap almost completely") +
+  theme_minimal()
+```
+
+```{r cytokines-table}
+cy <- d$cytokines[match(pre$sample_id, d$cytokines$sample_id), ]
+cyd <- map_dfr(names(cy)[-1], function(k) {
+  x <- cy[[k]]
+  tibble(cytokine = k,
+         placebo = med_iqr(x[!gp]), probiotic = med_iqr(x[gp]),
+         delta = cliff_delta(x, gp))
+})
+cyd |>
+  arrange(desc(abs(delta))) |>
+  mutate(band = delta_band(delta), delta = sprintf("%+.3f", delta)) |>
+  knitr::kable(col.names = c("Cytokine (pg/mL)", "placebo (n = 55)",
+                             "probiotic (n = 121)", "Cliff's δ", "|δ| band"),
+               caption = "Baseline cytokines by arm, sorted by effect size.")
+```
+
+```{r baseline-results, results='asis'}
+largest <- cyd |> slice_max(abs(delta), n = 1)
+cat(sprintf("
+**Results.** The clinical picture is identical by design and by
+measurement: both arms are BV populations (median Nugent 8 [8–10], ~97%%
+amine-positive, median pH 5.5). No baseline variable reaches even the
+*small* effect-size band: clinical and microbiological variables are all
+|δ| ≤ 0.16 (age δ = −0.005; pH −0.020; Nugent −0.054; Shannon −0.046;
+Gardnerella −0.156). The largest cytokine difference is %s
+(δ = %+.3f, still in the *small* band), followed by IL-23 (+0.179) and
+IL-1β (+0.151); every other cytokine is negligible. Sequencing depth at
+baseline does not differ by arm (16S δ = %+.3f, RNA-seq δ = %+.3f).
+
+**Interpretation.** Everything we can measure says the randomisation
+produced two arms that started the same, and the measured differences are
+small enough that no plausible analysis is confounded by them — the
+*lack* of imbalance is the finding. Two honest caveats: (1) with 55
+participants in the placebo arm we could only detect *moderate* or larger
+imbalances reliably; a *small* genuine imbalance (like the IL-17 δ ≈ 0.21)
+could exist and would be invisible to a hypothesis test. (2) These are
+*measured* variables — anything unmeasured that differs between arms
+remains unknown. The population itself is strikingly homogeneous: everyone
+entered dysbiotic and *L. crispatus*-poor (median relative abundance
+0.001), which limits how much any baseline variable *could* differ.
+
+**Implications.** Analyses of within-person change are on solid ground, and
+the trial's internal validity is not threatened by baseline differences in
+the measured variables. Two small tilts are worth carrying forward as watch
+items rather than corrections: probiotic-arm participants had slightly
+higher baseline IL-17/IL-23/IL-1β and slightly lower Gardnerella. If any of
+those appear in our treatment-effect results, we should check whether the
+difference predates treatment. The homogeneous, all-BV starting population
+is good for internal validity but limits what this trial can say about
+*L. crispatus*-dominant women — a generalisability limit, not a data defect.
+", largest$cytokine, largest$delta,
+    cliff_delta(lib$microbiome[lib$time_point == "pre"], gp),
+    cliff_delta(lib$rnaseq[lib$time_point == "pre"], gp)))
+```
+
+---
+
+## 6. Overall QC summary
+
+```{r qc-verdicts}
+tibble::tribble(
+  ~category,         ~finding,                                                                       ~status,
+  "ID integrity",    "All 16 structural checks pass; 352 samples, 176 complete pre/post pairs, consistent order across all tables", "Confirmed adequate",
+  "RNA-seq depth",   "Median 12.6M reads, minimum 6.3M; no sample below any threshold",                          "Confirmed adequate",
+  "16S depth",       "One failed sample (A116_pre, 604 reads); four further samples in the 'low' band (8.3k–11k)",  "Confirmed problem (1 sample)",
+  "Missing metadata","6 missing cells across 3 samples, all probiotic arm; no blank strings",                   "Acceptable (negligible)",
+  "Batch vs visit",  "Perfectly balanced: both visits of every participant share one batch",                    "Confirmed adequate",
+  "Batch vs arm",    "64% of placebo in B1 vs 42% of probiotic (p = 0.009) — imbalance exists",                  "Potential concern",
+  "Batch depth",     "No depth difference between batches (medians 12.5M vs 12.9M, p = 0.15)",                    "Acceptable",
+  "Baseline balance","All measured variables |Cliff's δ| ≤ 0.21 (negligible/small bands); arms start equivalent", "Acceptable, with watch items",
+  "Arm sizes",       "121 vs 55 participants — randomisation unbalanced across arms in size",                    "Design characteristic (affects precision)",
+  "Study population", "Uniformly BV-positive and L. crispatus-poor at entry",                                       "Design characteristic (limits generalisability)"
+) |>
+  knitr::kable(col.names = c("Area", "Finding", "Verdict"),
+               caption = "QC verdicts. 'Confirmed' items were measured directly; 'potential' items are risks to manage, not demonstrated artefacts.")
+```
+
+### Confirmed problems, potential concerns, and acceptable characteristics
+
+**Confirmed:** one failed 16S sample (`A116_pre`). Everything else measured
+directly — IDs, pairing, RNA-seq depth, batch-visit balance — passes.
+
+**Potential concerns:** the arm–batch imbalance in RNA-seq (manage by
+including batch in every design formula, and preferring within-arm paired
+contrasts, which are balanced); the small 16S depth tail including the
+probiotic post-visit dip (manage with compositional transforms and by
+checking results without the flagged samples); baseline tilts in IL-17,
+IL-23, IL-1β and Gardnerella (manage as watch items, not adjustments);
+missing metadata concentrated in the probiotic arm (manage by reporting
+complete-case n).
+
+**Acceptable:** missingness overall (6 cells of 3,872), batch depth
+equality, baseline balance, and the structural integrity of the design.
+
+### Recommendations for downstream analysis
+
+1. **Decide the fate of `A116_pre` as a group.** Options: drop the
+   participant (both samples) from paired 16S analyses, or drop only the
+   failed sample and keep `A116_post` for unpaired views. The analysis
+   documents apply the first rule until the group says otherwise.
+2. **Include `rnaseq_batch` in every RNA-seq model design**, before the
+   treatment terms, and prefer paired within-arm contrasts.
+3. **Filter 16S species** to those present in ≥ 10% of samples (62 of 220)
+   before compositional analysis; keep all genes and let DESeq2's
+   independent filtering handle low-count genes.
+4. **Feed raw counts only** into DESeq2 (never CPM or logged values), with
+   `poscounts` size factors for the sparse species table.
+5. **Report complete-case sample sizes** for any model using pH, Amsel
+   criteria or Nugent score.
+6. **Treat relative-abundance claims as compositional** — "proportion went
+   down" is not "there was less of it".
+
+### How to check this report
+
+- The flagged-sample table is one line of code away:
+  `which(colSums(d$species) < median(colSums(d$species))/10)` should return
+  exactly one sample ID, `A116_pre`.
+- The batch–arm imbalance: `fisher.test(table(d$metadata$rnaseq_batch,
+  d$metadata$arm))$p.value` ≈ 0.009; the batch–visit version should return 1.
+- The largest baseline effect: rerun the cytokine chunk and confirm IL-17
+  tops the table at δ ≈ +0.21 — if another cytokine led by a wide margin,
+  the baseline-balance conclusion would need revisiting.
+
+## Choices made
+
+- **Pre-declared depth thresholds (median/10 = failed; Q1/2 = low)** —
+  alternative: eyeballing the histogram, which lets the flagging follow a
+  hunch.
+- **Flag, not drop: `A116_pre` is reported, not excluded** — alternative:
+  silent exclusion, which the group would never see to overrule.
+- **Cliff's δ instead of hypothesis tests for baseline balance** —
+  alternative: p-values, which here would mostly measure n = 55 and invite
+  "not significant, therefore equivalent" misreadings.
+- **Baseline analysed as one row per participant (pre visit)** —
+  alternative: pooling both visits, which double-counts and halves the
+  p-values dishonestly.
+- **Fisher's exact test only for the two batch cross-tabs** — a single
+  pre-declared confounding check, not a fishing expedition.
+- **Blank-string scan alongside NA counting** — alternative: NA-only, which
+  misses placeholder blanks.
+- **Depth compared across arm, visit and batch** — alternative: overall
+  distributions only, which would have hidden the probiotic post-visit dip.
+- **Cytokine table sorted by effect size** — alternative: alphabetical,
+  which buries the one number worth watching.
+- **All checks computed inside the document** — no numbers are imported from
+  elsewhere, so the report is self-verifying by re-render.

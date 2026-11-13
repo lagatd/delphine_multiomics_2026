@@ -69,6 +69,10 @@ so the same microViz pipeline works on human genes.
 
 On Wednesday and Thursday I work on a group project in `group_project/`.
 
+The question we are working on right now: **Did the community shift from
+pre to post, and differently by arm?** (Study A, the probiotic trial: each
+participant has a `pre` and `post` visit, and `arm` is probiotic or placebo.)
+
 - Write each analysis as a Quarto document in `group_project/`, render it with
   `quarto render`, and tell me the path of the HTML file.
 - End every document with a section called `## Choices made`. List each

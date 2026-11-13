@@ -10,3 +10,5 @@
 # Rendered notebook output. Participants render locally; the template ships
 # only the .qmd sources.
 *.html
+# Quarto/R chunk caches - machine-specific, too big for GitHub
+*_cache/

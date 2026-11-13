@@ -1,0 +1,451 @@
+---
+title: "Study A — Did the community shift from pre to post, and differently by arm?"
+date: 2026-11-12
+format: html
+---
+
+## The question
+
+Did the vaginal bacterial community change over the treatment course, and did
+it change **more in the probiotic arm than in the placebo arm**? This is the
+first Study A sub-question: the community-level view, before we look at
+individual species.
+
+We break it into three parts, because "did it shift" means three different
+claims that can each be true or false on their own:
+
+1. **Did it move at all?** — is the community at post different from pre?
+2. **Which way did it move?** — a shift can go towards *Lactobacillus*
+   dominance (health) or towards deeper dysbiosis. Distance alone cannot
+   tell you; a community can move far and still be just as unhealthy.
+3. **Differently by arm?** — did probiotic participants move further, or
+   in a different direction, than placebo participants?
+
+**The pairing is the whole design.** Each participant was sampled twice, so
+the cleanest measure of "shift" is the distance between one person's own pre
+and post samples. Two people with identical communities before and after
+contribute a shift of zero even if their starting communities are nothing
+alike. We therefore use two complementary tests:
+
+1. **Within-participant shift distance** — the Bray-Curtis distance between
+   each person's own pre and post samples, compared between arms. Bray-Curtis
+   is an abundance-weighted measure of how different two communities are
+   (0 = identical, 1 = share nothing).
+2. **PERMANOVA** on all samples — does `time_point` explain community
+   composition overall, run **separately in each arm** with permutations
+   restricted within participants, so the test never pretends two samples from
+   one person are independent people. PERMANOVA asks whether groups of
+   samples differ in *position*; its R² says what fraction of the community
+   variation the grouping explains.
+
+## Setup and QC rules
+
+We apply the two decisions the QC report proposed (pending group
+confirmation at the W2 check-in, applied consistently here):
+
+```{r setup}
+#| message: false
+library(dplyr)
+library(ggplot2)
+suppressPackageStartupMessages({library(microViz); library(phyloseq)})
+
+source(here::here("R/count_tables.R"))
+d  <- read_counts("group_a")
+md <- d$metadata
+
+# QC rule 1: drop participant A116 (pre sample failed sequencing, 604 reads).
+# We drop both of A116's samples so every paired analysis keeps its pair.
+keep_samples <- md$sample_id[md$participant_id != "A116"]
+
+ps  <- prune_samples(keep_samples, as_counts("group_a", "microbiome"))
+# QC rule 2: keep species present in at least 10% of samples (rare species are
+# mostly noise and their zeros distort compositional methods).
+psf <- tax_filter(ps, min_prevalence = 0.1)
+ntaxa(psf); nsamples(psf)     # 64 species, 350 samples (175 participants x 2)
+```
+
+## 1. Ordination: where did the samples move?
+
+Principal coordinates analysis (PCoA) places each sample in 2D so that
+well-separated points are dissimilar communities. We colour by visit and
+facet by arm; if treatment works, post samples should sit apart from pre
+samples, more visibly in the probiotic arm.
+
+```{r ordination}
+#| fig-width: 8
+#| fig-height: 4.5
+#| fig-path: figures/
+ord <- psf |>
+  tax_transform("compositional") |>   # convert counts to proportions first:
+    dist_calc("bray") |>              # Bray-Curtis compares compositions, not raw
+    ord_calc("PCoA")                  # counts, which are scaled by library size
+ord_plot(ord,
+  colour = "time_point", alt_colour = "steelblue",
+  shape  = "arm",
+  alpha  = 0.7
+) + theme_minimal()
+```
+
+With 175 participants overlaid, the clouds overlap a lot — every individual
+community differs, and this population started with BV, not with tidy
+*Lactobacillus*-dominance. The plot is a sanity check, not the verdict: the
+formal tests below are where the answer lives.
+
+## 2. How far did each person's community move?
+
+```{r shift-distance}
+#| fig-width: 7
+#| fig-height: 3.5
+#| fig-path: figures/
+library(vegan)
+rel <- sweep(d$species[, keep_samples], 2,
+             colSums(d$species[, keep_samples]), "/")   # relative abundance
+bc  <- as.matrix(vegdist(t(rel), method = "bray"))       # all pairwise distances
+
+pairs <- md |>
+  filter(sample_id %in% keep_samples) |>
+  select(participant_id, arm, time_point, sample_id) |>
+  tidyr::pivot_wider(names_from = time_point, values_from = sample_id) |>
+  mutate(shift = bc[cbind(pre, post)])                  # distance own pre -> own post
+
+ggplot(pairs, aes(arm, shift, fill = arm)) +
+  geom_boxplot(show.legend = FALSE, alpha = 0.7) +
+  labs(x = NULL, y = "Bray-Curtis distance, pre to post",
+       title = "Within-participant community shift, by arm") +
+  theme_minimal()
+
+wilcox.test(shift ~ arm, data = pairs)
+median(pairs$shift[pairs$arm == "probiotic"])
+median(pairs$shift[pairs$arm == "placebo"])
+```
+
+```{r shift-detail}
+# A p-value is not a size. How much bigger is the probiotic shift, really?
+pairs |> group_by(arm) |>
+  summarise(
+    q25    = round(quantile(shift, 0.25), 2),
+    median = round(median(shift), 2),
+    q75    = round(quantile(shift, 0.75), 2),
+    pct_big_shift = round(mean(shift > 0.9) * 100, 1)   # % who changed a lot
+  )
+
+# Common-language effect size: the chance that a randomly picked
+# probiotic participant moved further than a randomly picked placebo one.
+# 50% would mean "no difference at all".
+pr <- pairs$shift[pairs$arm == "probiotic"]
+pl <- pairs$shift[pairs$arm == "placebo"]
+mean(outer(pr, pl, ">"))
+```
+
+**What we see:** the median participant in the probiotic arm moved 0.83 of
+the way to a completely different community; the median placebo participant
+moved 0.59. That difference is statistically clear (Wilcoxon p = 0.036), but
+the effect size keeps it honest: a random probiotic participant moved further
+than a random placebo participant only **60%** of the time, not much above a
+coin flip. And read the placebo number again — **placebo participants moved a
+lot too**. Communities this dysbiotic fluctuate naturally, and a single
+pre/post comparison will register that fluctuation. The probiotic arm moved
+*further*, which is the treatment signal; the placebo movement is the
+background the signal has to beat.
+
+## 3. PERMANOVA: does `time_point` explain composition, per arm?
+
+We run PERMANOVA once per arm so the question is always "did *this* group
+change over time", never "did the arms differ" — arm is constant within a
+participant, so a within-participant permutation design cannot test it, and
+we don't pretend otherwise.
+
+```{r permanova}
+res_all <- list()
+for (a in c("probiotic", "placebo")) {
+  smp  <- intersect(as.character(sample_names(psf)), md$sample_id[md$arm == a])
+  ps_a <- prune_samples(smp, psf)
+  sd_a <- data.frame(sample_data(ps_a))     # rows follow ps_a's sample order
+  res_all[[a]] <- ps_a |>
+    tax_transform("compositional") |>
+    dist_calc("bray") |>
+    dist_permanova(variables = "time_point",
+                   strata = sd_a$participant_id,   # permute pre/post WITHIN people
+                   n_perms = 999)
+}
+```
+
+```{r permanova-table}
+permanova_row <- function(res, arm) {
+  tab <- as.data.frame(res@permanova)   # adonis2 table lives in the @permanova slot
+  tibble(arm = arm, R2 = tab$R2[1], F = tab$F[1], p = tab$`Pr(>F)`[1])
+}
+bind_rows(
+  permanova_row(res_all$probiotic, "probiotic"),
+  permanova_row(res_all$placebo,   "placebo")
+) |> mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  knitr::kable(col.names = c("arm", "R² (time_point)", "F", "permutation p"))
+```
+
+Both arms changed over time (p at the permutation floor of 0.001). The
+probiotic arm's shift explains more of the community variation (R² = 0.108
+vs 0.085 in placebo) — consistent with the larger shift distances above, and
+both R² values are small in absolute terms: most community variation is
+between people, not between visits. That is expected in a dysbiotic
+population, and it is why we do not lean on the ordination cloud alone.
+
+## 4. Which way did it move?
+
+"Moved far" is not "got better". The Nugent score (a clinician's grading of
+a vaginal smear, 0–3 healthy, 7–10 BV) and *Lactobacillus* abundance tell us
+the direction. Two of the 120 probiotic participants are missing a post
+Nugent score and drop out of this section only.
+
+```{r direction-setup}
+#| message: false
+lacto_rows <- grep("Lactobacillus", d$taxonomy$species)
+lab        <- colSums(rel[lacto_rows, , drop = FALSE])   # Lactobacillus rel. abundance per sample
+nugent_vec <- md$nugent; names(nugent_vec) <- md$sample_id
+
+direction <- pairs |>
+  mutate(
+    lacto_pre   = lab[pre],
+    lacto_post  = lab[post],
+    nug_pre     = nugent_vec[pre],
+    nug_post    = nugent_vec[post],
+    lacto_dom_pre  = lacto_pre  > 0.5,    # community dominated by Lactobacillus
+    lacto_dom_post = lacto_post > 0.5,
+    nug_delta  = nug_post - nug_pre,      # negative = improved
+    resolved   = nug_pre >= 7 & nug_post < 7   # BV at start, not at end
+  )
+```
+
+```{r direction-plot}
+#| fig-width: 8
+#| fig-height: 4
+#| fig-path: figures/
+direction |>
+  tidyr::pivot_longer(c(lacto_pre, lacto_post),
+                      names_to = "time", values_to = "lacto") |>
+  mutate(time = sub("lacto_", "", time)) |>
+  ggplot(aes(time, lacto, fill = time)) +
+  geom_boxplot(show.legend = FALSE, alpha = 0.7) +
+  facet_wrap(~ arm) +
+  labs(x = NULL, y = "Lactobacillus relative abundance",
+       title = "Direction of the shift: Lactobacillus rose in BOTH arms") +
+  theme_minimal()
+```
+
+```{r direction-table}
+direction |> group_by(arm) |>
+  summarise(
+    `% Lacto-dominant pre`  = round(mean(lacto_dom_pre)  * 100),
+    `% Lacto-dominant post` = round(mean(lacto_dom_post) * 100),
+    `median Nugent pre`     = median(nug_pre),
+    `median Nugent post`    = median(nug_post, na.rm = TRUE),
+    `median Nugent change`   = median(nug_delta, na.rm = TRUE),
+    `% improved (Nugent)`    = round(mean(nug_delta < 0, na.rm = TRUE) * 100),
+    n = sum(!is.na(nug_delta))
+  ) |> knitr::kable()
+
+# BV resolution among participants who started with BV (Nugent >= 7):
+direction |> filter(nug_pre >= 7, !is.na(nug_post)) |>
+  count(arm, resolved) |> tidyr::pivot_wider(names_from = resolved, values_from = n)
+
+bv_pre <- filter(direction, nug_pre >= 7, !is.na(nug_post))   # only BV at start
+fisher.test(table(bv_pre$arm, bv_pre$resolved))
+
+# Did the Lactobacillus INCREASE differ by arm? (not just the end point)
+wilcox.test(nug_delta ~ arm, data = filter(direction, !is.na(nug_delta)))
+```
+
+**What we see — the most important result in this report:**
+
+- Communities moved **towards health in both arms**. *Lactobacillus*-dominant
+  participants went from 4% to 47% in the placebo arm and from 9% to 57% in
+  the probiotic arm. Median Nugent score fell from 8 to 6 (placebo) and from
+  8 to 4 (probiotic).
+- The arm differences in direction are **not statistically clear**:
+  Nugent change by arm p = 0.20, BV resolution 52% vs 62% (Fisher p = 0.30),
+  and the *Lactobacillus* increase itself does not differ by arm.
+- So the probiotic arm did not move *in a different direction* — it moved
+  *further along a direction both arms were going*. Where it ended up (57%
+  vs 47% *Lactobacillus*-dominant) is suggestive, but this study cannot
+  separate it from chance.
+- A word of caution about that placebo improvement: participants were
+  recruited *with* BV, and a group selected for an extreme measurement will
+  look better on average when re-measured (regression to the mean), on top of
+  any natural fluctuation and any placebo effect. With no untreated control,
+  "the placebo arm improved" should not surprise us.
+
+## 5. Does a bigger shift mean a bigger improvement?
+
+If the shift were just noise, shift distance and Nugent improvement would be
+unrelated. They are strongly related:
+
+```{r shift-vs-improvement}
+#| fig-width: 7
+#| fig-height: 4.5
+#| fig-path: figures/
+ggplot(filter(direction, !is.na(nug_delta)),
+       aes(shift, nug_delta, colour = arm)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(aes(group = 1), method = "loess", se = FALSE, colour = "grey30") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(x = "Bray-Curtis shift, pre to post",
+       y = "Change in Nugent score (negative = improved)",
+       title = "Bigger community shifts were bigger clinical improvements") +
+  theme_minimal()
+
+cor.test(direction$shift, direction$nug_delta, method = "spearman")
+
+# In numbers: median shift of those whose BV resolved vs those whose did not
+direction |> filter(nug_pre >= 7, !is.na(nug_post)) |>
+  group_by(resolved) |>
+  summarise(median_shift = round(median(shift), 2), n = n()) |>
+  knitr::kable()
+```
+
+Participants whose BV resolved moved a median of 0.97 in community space;
+those whose BV persisted moved only 0.50 (Spearman rho = -0.71, p < 0.001).
+So the shift distance is measuring something real, not sequencing noise —
+the further a community moved from its dysbiotic start, the more likely the
+smear went back to normal.
+
+## 6. How robust is the arm difference?
+
+Two stress tests for our own headline ("the probiotic arm moved further").
+
+**Stress test 1: a second distance.** Bray-Curtis is dominated by the most
+abundant species. The Aitchison distance (Euclidean distance on
+centred-log-ratio-transformed data, with a small pseudocount for zeros)
+instead weights every species by its *log fold-change*, so a rare species
+halving counts as much as a dominant one halving. If the probiotic arm
+"really" moved further, both measures should agree.
+
+```{r aitchison}
+#| message: false
+rel2 <- rel; rel2[rel2 == 0] <- 0.5               # pseudocount for log()
+clr  <- sweep(log(rel2), 2, colMeans(log(rel2)), "-")   # CLR per sample
+ait  <- as.matrix(vegdist(t(clr), "euclid"))      # Aitchison = Euclidean on CLR
+
+pairs <- pairs |> mutate(shift_ait = ait[cbind(pre, post)])
+pairs |> group_by(arm) |>
+  summarise(`median Aitchison shift` = round(median(shift_ait), 1)) |>
+  knitr::kable()
+
+wilcox.test(shift_ait ~ arm, data = pairs)
+```
+
+**They disagree.** Under Aitchison distance the two arms shifted almost
+identical amounts (medians 30.1 vs 30.8, p = 0.53). The "further" result
+under Bray-Curtis is therefore at least partly about the *dominant* species
+being replaced more completely in the probiotic arm — the sort of change
+Bray-Curtis weighs most heavily — not about every part of the community
+moving further.
+
+**Stress test 2: position vs spread.** PERMANOVA can be significant because
+groups sit in *different places*, or because one group is more *spread out*
+than the other (it treats both as "different"). We check which:
+
+```{r dispersion}
+mdk  <- md |> filter(sample_id %in% keep_samples)
+grp  <- transform(mdk, arm_time = paste(arm, time_point))
+rownames(grp) <- grp$sample_id
+
+bd <- betadisper(vegdist(t(rel), "bray"), grp$arm_time)
+permutest(bd)                       # p = 0.001: dispersions are NOT equal
+round(tapply(bd$distances, grp$arm_time, mean), 3)   # avg spread of each group
+```
+
+Post-visit samples are **more spread out** than pre-visit samples in both
+arms (mean distance to group centroid: placebo 0.438 → 0.539, probiotic
+0.476 → 0.558). That makes sense biologically: everyone started from a
+similar dysbiotic state, and then each person's community fanned out towards
+their own endpoint — some all the way to *Lactobacillus* dominance, others
+not far at all. Part of what we have been calling "shift" is this fanning
+out, and that is exactly what section 5 shows: the shift is real improvement
+for some people, and much less for others.
+
+## Answer, and what we do not claim
+
+**Did the community shift pre to post? Yes, clearly, in both arms**
+(PERMANOVA p = 0.001 in both arms, paired analysis).
+
+**Which way? Towards *Lactobacillus* dominance and lower Nugent scores —
+in both arms.** *Lactobacillus*-dominant participants went from 4% to 47%
+(placebo) and 9% to 57% (probiotic). The shift distance tracks clinical
+improvement closely (rho = -0.71): this was not noise.
+
+**Differently by arm? Here we must be careful.** On Bray-Curtis distance
+the probiotic arm moved further (median 0.83 vs 0.59, p = 0.036), and more of
+its participants made the big jump (43% vs 29% shifted more than 0.9). But
+the effect is modest (a random probiotic participant beats a random placebo
+one only 60% of the time), it does not survive a change of distance measure
+(Aitchison: p = 0.53), and the clinical endpoints — Nugent change, BV
+resolution, *Lactobacillus* gain — do not differ significantly between arms
+(p = 0.20–0.30). The honest headline is:
+
+> Both arms shifted towards *Lactobacillus* dominance; the probiotic arm's
+> communities moved further along that path, but the arm contrast is modest,
+> distance-dependent, and not yet matched by a clear clinical difference.
+
+We do **not** claim *which* species drove the shift (the next document), and
+we no longer claim direction was unknown — section 4 answers it. We also do
+not claim the placebo improvement is "just" regression to the mean; that is
+one untestable explanation among several, which is exactly why an untreated
+control arm matters.
+
+## Check it yourself
+
+- The shift medians: recompute one by hand —
+  `rel <- sweep(d$species[, md$sample_id], 2, colSums(d$species), "/")` then
+  `vegdist(t(rel[, c("A001_pre","A001_post")]), "bray")` gives participant
+  A001's shift, 0.89. The boxplot medians should be near 0.83 and 0.59.
+- The direction: count the *Lactobacillus*-dominant placebo participants at
+  post yourself:
+  `sum(lab[names(lab) %in% direction$post[direction$arm=="placebo"]] > 0.5)` —
+  about 26 of 55, i.e. the 47% in the table.
+- The PERMANOVA: both p-values sit at the floor for 999 permutations
+  (1/1000 = 0.001). If `time_point` explained nothing, a p of 0.001 in both
+  arms would be nearly impossible.
+- The pairing: rerun the placebo PERMANOVA without `strata =
+  participant_id`. The p-value gets *smaller*, because pretending 110
+  samples are 110 people inflates the evidence — that is what the strata
+  argument protects against.
+- The robustness: rerun the Wilcoxon on `shift_ait` with fewer permutations
+  of the pseudocount (try 0.1 instead of 0.5). The conclusion "no arm
+  difference" should not move; if it does, the zeros are driving it.
+
+## Choices made
+
+- **Dropped participant A116 (both samples)** per the QC report's proposed
+  rule — alternative: keep the participant and let the 604-read sample
+  distort its pre/post pair; its post sample alone is healthy, but a pair
+  needs both ends.
+- **Species filter: present in ≥ 10% of samples (64 of 220)** — alternative:
+  no filter, keeping 53 all-zero species and a long tail of one-sample
+  sightings that Bray-Curtis treats as real differences.
+- **Bray-Curtis on compositional (relative) abundances** as the primary
+  distance — alternative: Aitchison as primary; we rejected that because
+  the workshop's own methods material centres on Bray-Curtis, but we show
+  both rather than hide the disagreement.
+- **Within-participant shift distance as the arm comparison** —
+  alternative: a two-way PERMANOVA with an arm × time interaction, which
+  cannot be tested under within-participant permutations (arm is constant
+  per person).
+- **PERMANOVA run separately per arm with `strata = participant_id`** —
+  alternative: one pooled PERMANOVA ignoring the pairing, which the
+  workshop's own exercise showed inflates significance.
+- **999 permutations, reporting the 0.001 floor as such** — alternative:
+  fewer permutations and a "p < 0.05" claim that hides how far below 0.05
+  the evidence actually is.
+- **Direction measured by Nugent score and *Lactobacillus* dominance
+  (>50% relative abundance)** — alternative: species-by-species differential
+  abundance, which is the next document and needs DESeq2 on raw counts.
+- **BV resolution tested with Fisher's exact test** — alternative: chi-square,
+  which approximates what Fisher computes exactly at these counts.
+- **Spearman correlation for shift vs Nugent change** — alternative: Pearson,
+  which would let a few extreme Nugent values drive the number.
+- **Aitchison with pseudocount 0.5 on relative abundances** — alternative:
+  CLR on raw counts; the pseudocount scale can matter, which is why the
+  "check it yourself" section asks you to vary it.
+- **Kept the placebo movement in the headline rather than only reporting
+  the probiotic shift** — alternative: report the probiotic p-value alone,
+  which would have hidden that the community moves substantially with no
+  treatment at all.

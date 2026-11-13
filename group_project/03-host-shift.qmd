@@ -1,0 +1,398 @@
+---
+title: "Study A — Did host gene expression change with treatment?"
+date: 2026-11-12
+format: html
+---
+
+## The question
+
+The last document looked at the *bacteria*. This one looks at the *host*:
+did the expression of vaginal epithelial genes change from pre to post, and
+did the probiotic arm change differently from the placebo arm?
+
+This is the week's set-piece: the gene count table is exactly the same shape
+as the species table, so the microViz pipeline — written for bacteria — runs
+on human genes unchanged. We use it for the transcriptome-wide view, and
+DESeq2 for the per-gene view.
+
+Two sub-questions again:
+
+1. **Did gene expression change at all?** — both overall (is the
+   transcriptome at post different from pre?) and gene by gene.
+2. **Differently by arm?** — did the probiotic arm's genes change more, or
+   in different genes, than the placebo arm's?
+
+Two workshop rules we follow strictly. **Raw counts go into DESeq2** — never
+CPM, never logged; it does its own normalisation. And **the column order of
+the count matrix must match the row order of the sample table** — DESeq2
+will not warn you, it will just be wrong, so we assert it.
+
+## Setup and QC rules
+
+Same population as the community document: participant A116 is dropped
+(both visits), giving 175 participants × 2 visits = 350 samples. Honest
+note: A116's *RNA-seq* is actually fine (10.7M and 12.6M reads) — the QC rule
+was about its failed microbiome sample. We keep the same people here so the
+two documents describe the same population, and list the alternative in
+`Choices made`.
+
+```{r setup}
+#| message: false
+library(dplyr)
+library(ggplot2)
+suppressPackageStartupMessages({library(microViz); library(phyloseq)})
+
+source(here::here("R/count_tables.R"))
+d  <- read_counts("group_a")
+md <- d$metadata
+g  <- d$genes
+
+keep_samples <- md$sample_id[md$participant_id != "A116"]   # 175 x 2 = 350
+```
+
+## 1. Transcriptome-wide: how far did each person's expression move?
+
+**Aitchison distance** is the standard distance for compositional count
+data: each sample's genes are log-transformed and recentred on that
+sample's own average, which turns counts into log-*ratios* — a gene
+doubling is the same change whether the library is big or small, and one
+very abundant gene no longer drowns out the rest. microViz computes it
+straight from raw counts (`dist_calc("aitchison")`).
+
+```{r gene-pcoa}
+#| fig-width: 8
+#| fig-height: 4.5
+#| fig-path: figures/
+ps  <- prune_samples(keep_samples, as_counts("group_a", "rnaseq"))
+# same prevalence rule as the community document: a gene must have
+# at least 10 counts in at least 10% of samples to enter.
+psf <- tax_filter(ps, min_prevalence = 0.1, prev_detection_threshold = 10)
+ntaxa(psf); nsamples(psf)     # 14217 genes, 350 samples
+
+ord <- psf |>
+  dist_calc("aitchison") |>   # Aitchison = Euclidean on log-ratioed genes
+  ord_calc("PCoA")
+ord_plot(ord,
+  colour = "time_point", alt_colour = "steelblue",
+  shape  = "arm",
+  alpha  = 0.7
+) + theme_minimal()
+```
+
+```{r gene-shift}
+#| fig-width: 7
+#| fig-height: 3.5
+#| fig-path: figures/
+dm <- as.matrix(ord@dist)     # the full sample-to-sample distance matrix
+
+gp <- data.frame(sample_data(psf))
+pairs <- gp |>
+  select(participant_id, arm, time_point) |>
+  mutate(sample_id = rownames(gp)) |>
+  select(participant_id, arm, time_point, sample_id) |>
+  tidyr::pivot_wider(names_from = time_point, values_from = sample_id) |>
+  mutate(shift = dm[cbind(pre, post)])   # own-pre-to-own-post distance
+
+ggplot(pairs, aes(arm, shift, fill = arm)) +
+  geom_boxplot(show.legend = FALSE, alpha = 0.7) +
+  labs(x = NULL, y = "Aitchison distance, pre to post",
+       title = "Within-participant expression shift, by arm") +
+  theme_minimal()
+
+wilcox.test(shift ~ arm, data = pairs)
+median(pairs$shift[pairs$arm == "probiotic"])
+median(pairs$shift[pairs$arm == "placebo"])
+```
+
+**What we see:** every participant's expression profile moved, but the two
+arms moved the **same amount** — median Aitchison shift 71.9 (probiotic) vs
+70.9 (placebo), Wilcoxon p = 0.55. Nothing like the community result, where
+the probiotic arm's bacteria moved further. (For scale, these Aitchison
+numbers are on a log-ratio scale, not 0–1 like Bray-Curtis.)
+
+Is there any overall pre→post signal at all in the genes? PERMANOVA, run
+per arm with permutations restricted within participants, exactly as in
+the community document:
+
+```{r gene-permanova}
+res_perm <- list()
+for (a in c("probiotic", "placebo")) {
+  smp  <- as.character(sample_names(psf))[gp$arm == a]
+  ps_a <- prune_samples(smp, psf)
+  sd_a <- data.frame(sample_data(ps_a))     # rows follow ps_a's sample order
+  res_perm[[a]] <- ps_a |>
+    dist_calc("aitchison") |>
+    dist_permanova(variables = "time_point",
+                   strata = sd_a$participant_id,   # permute within people
+                   n_perms = 999)
+}
+permanova_row <- function(res, arm) {
+  tab <- as.data.frame(res@permanova)
+  tibble(arm = arm, R2 = tab$R2[1], F = tab$F[1], p = tab$`Pr(>F)`[1])
+}
+bind_rows(
+  permanova_row(res_perm$probiotic, "probiotic"),
+  permanova_row(res_perm$placebo,   "placebo")
+) |> mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  knitr::kable(col.names = c("arm", "R² (time_point)", "F", "permutation p"))
+```
+
+Yes, but small: `time_point` explains 0.7% of gene-expression variation in
+the probiotic arm (p = 0.001) and 1.0% in the placebo arm (p = 0.016). Most
+variation in expression is between people, and whatever changes with
+treatment is a small, coordinated part of the transcriptome. The next
+section finds out which part.
+
+## 2. Which genes changed? DESeq2, per arm
+
+We fit DESeq2 separately in each arm with the paired design
+`~ participant + time`. Each participant appears twice, so the model asks:
+**what changed within the same people from pre to post?** Library-size
+differences between samples are handled by DESeq2's size factors, and the
+`participant` term means a person who simply runs "high" on everything does
+not distort the pre/post comparison.
+
+One design check first: every participant's two samples were sequenced in
+the same RNA-seq batch (`rnaseq_batch` is constant within person), so batch
+is already absorbed by the `participant` term and does not need its own
+column.
+
+```{r deseq2}
+#| cache: true
+#| message: false
+#| warning: false
+# Warning: this chunk takes roughly 30 minutes the FIRST time it runs
+# (175 participant columns make a big model). knitr caches it, so later
+# re-renders skip it unless this code changes.
+library(DESeq2)
+
+mdk <- md |> filter(sample_id %in% keep_samples) |> as.data.frame()
+rownames(mdk) <- mdk$sample_id
+gk  <- g[, keep_samples]
+stopifnot(identical(colnames(gk), rownames(mdk)))   # THE order check
+gk  <- gk[rowSums(gk >= 10) >= 35, ]                # same filter as above: 14217
+
+run_arm <- function(a) {
+  cd <- mdk[mdk$arm == a, ]            # rows = samples, in matrix column order
+  m  <- gk[, rownames(cd)]
+  cd$participant <- factor(cd$participant_id)
+  cd$time <- relevel(factor(cd$time_point), "pre")   # 'pre' is the reference
+  dds <- DESeqDataSetFromMatrix(m, cd, design = ~ participant + time)
+  dds <- DESeq(dds, quiet = TRUE)
+  list(dds = dds, res = results(dds, contrast = c("time", "post", "pre")))
+}
+res_all <- list()
+for (a in c("probiotic", "placebo")) res_all[[a]] <- run_arm(a)
+```
+
+```{r deseq2-counts}
+#| fig-width: 7
+#| fig-height: 4
+#| fig-path: figures/
+de_summary <- bind_rows(lapply(names(res_all), function(a) {
+  r <- as.data.frame(res_all[[a]]$res)
+  tibble(arm = a,
+         `significant (padj<0.05)` = sum(r$padj < 0.05, na.rm = TRUE),
+         `  of which |LFC| > 0.5` = sum(r$padj < 0.05 & abs(r$log2FoldChange) > 0.5, na.rm = TRUE),
+         up  = sum(r$padj < 0.05 & r$log2FoldChange > 0, na.rm = TRUE),
+         down = sum(r$padj < 0.05 & r$log2FoldChange < 0, na.rm = TRUE))
+})) |> mutate(across(where(is.numeric), as.integer))
+knitr::kable(de_summary)
+
+de_summary |>
+  tidyr::pivot_longer(c(up, down), names_to = "direction", values_to = "n") |>
+  ggplot(aes(arm, n, fill = direction)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  labs(x = NULL, y = "number of genes (padj < 0.05)",
+       title = "Expression changes at one month: more genes move in the probiotic arm") +
+  theme_minimal()
+```
+
+**What we see:** expression changed in **both arms**, but more genes cleared
+the significance bar in the probiotic arm: **812 genes** there (390 up, 422
+down) versus **233** in placebo (92 up, 141 down). Most of these are
+*modest* changes — only 78 (probiotic) and 35 (placebo) also have a
+log2 fold-change above 0.5, i.e. a 40% change or more. `padj` is the
+adjusted p-value: the false-discovery-rate-corrected version that accounts
+for running the test 14,217 times.
+
+The strongest hits, ranked by padj:
+
+```{r deseq2-top}
+sym <- d$gene_info |> mutate(symbol = coalesce(symbol, ensembl_gene_id))
+top_tab <- function(res, n = 10) {
+  df <- as.data.frame(res) |> arrange(padj) |> head(n)
+  tibble(gene      = sym$symbol[match(rownames(df), sym$ensembl_gene_id)],
+         `gene name` = sym$gene_name[match(rownames(df), sym$ensembl_gene_id)],
+         baseMean  = round(df$baseMean),
+         log2FC    = round(df$log2FoldChange, 2),
+         padj      = signif(df$padj, 2))
+}
+knitr::kable(top_tab(res_all$probiotic$res),
+             caption = "Probiotic arm: top genes, pre to post")
+knitr::kable(top_tab(res_all$placebo$res),
+             caption = "Placebo arm: top genes, pre to post")
+```
+
+The flavour of the two lists is different. The probiotic arm's strongest
+changes are *down-regulations* of mucosal/epithelial genes (DMBT1, FCGBP,
+SLC26A4, SLC9A3, TFPI). The placebo arm's are *up-regulations* of
+interferon-response and chemokine genes — **CXCL10** (+0.94), **CXCL11**
+(+1.35), **OAS2** — the classic "antiviral alarm" programme. Before making
+anything of that, we test the arm difference formally.
+
+## 3. Did the arms change differently?
+
+Two views: which genes were significant where, and a formal per-gene test
+of "changed differently in probiotic vs placebo".
+
+```{r overlap}
+sig_p <- rownames(as.data.frame(res_all$probiotic$res))[which(res_all$probiotic$res$padj < 0.05)]
+sig_l <- rownames(as.data.frame(res_all$placebo$res))[which(res_all$placebo$res$padj < 0.05)]
+c(both = sum(sig_p %in% sig_l),
+  probiotic_only = sum(!sig_p %in% sig_l),
+  placebo_only   = sum(!sig_l %in% sig_p))
+
+# the shared genes: same direction, or opposite?
+rp <- res_all$probiotic$res[sig_p %in% sig_l, ]
+rl <- res_all$placebo$res[sig_p %in% sig_l, ]
+sum(sign(rp$log2FoldChange) == sign(rl$log2FoldChange))   # of 37
+```
+
+Of the probiotic arm's 812 hits, only **37 are also hits in placebo** — and
+all 37 change in the *same direction*. So the bulk of the pre→post response
+is arm-specific in *significance*, though both arms do show some shared
+signal.
+
+For a formal arm contrast per gene: compare the two arms' log fold-changes.
+The two arms contain different people, so the two LFCs are independent
+estimates, and a **z test** of their difference — the difference divided by
+its combined uncertainty — is the interaction test ("did the change depend
+on the arm?"). We correct across genes as before.
+
+```{r interaction}
+cmn <- intersect(rownames(res_all$probiotic$res), rownames(res_all$placebo$res))
+rp <- res_all$probiotic$res[cmn, ]
+rl <- res_all$placebo$res[cmn, ]
+z  <- (rp$log2FoldChange - rl$log2FoldChange) / sqrt(rp$lfcSE^2 + rl$lfcSE^2)
+padj_int <- p.adjust(2 * pnorm(-abs(z)), "BH")
+
+c(sig_padj05 = sum(padj_int < 0.05, na.rm = TRUE),
+  sig_padj01 = sum(padj_int < 0.01, na.rm = TRUE))
+
+int_tab <- tibble(
+  ensembl = cmn[order(padj_int)][1:10],
+  gene = sym$symbol[cmn[order(padj_int)][1:10]],
+  `LFC probiotic` = round(rp$log2FoldChange[order(padj_int)][1:10], 2),
+  `LFC placebo`   = round(rl$log2FoldChange[order(padj_int)][1:10], 2),
+  padj = signif(padj_int[order(padj_int)][1:10], 2))
+knitr::kable(int_tab, caption = "Genes whose pre→post change differs most between arms")
+```
+
+Only **5 genes** pass the arm-contrast test at padj < 0.05, and **none**
+at padj < 0.01. But look at the top of that list: CXCL10, OAS2, STAT1,
+then MX1 and PARP14 just below the cut — the interferon-response programme
+again, this time saying it went **up in placebo and flat in probiotic**.
+Here is the strongest one, in everyone's raw-normalised counts:
+
+```{r cxcl10}
+#| fig-width: 8
+#| fig-height: 4.5
+#| fig-path: figures/
+gene_id <- sym$ensembl_gene_id[sym$symbol == "CXCL10"]
+pc <- rbind(
+  transform(plotCounts(res_all$probiotic$dds, gene_id, intgroup = "time_point",
+                      returnData = TRUE), arm = "probiotic"),
+  transform(plotCounts(res_all$placebo$dds,  gene_id, intgroup = "time_point",
+                      returnData = TRUE), arm = "placebo")
+)
+ggplot(pc, aes(time_point, count, colour = time_point)) +
+  geom_jitter(width = 0.15, alpha = 0.6, show.legend = FALSE) +
+  scale_y_log10() +
+  facet_wrap(~ arm) +
+  labs(title = "CXCL10, normalised counts (log scale), pre vs post",
+       subtitle = "Rises in placebo; stays flat in probiotic") +
+  theme_minimal()
+```
+
+## Answer, and what we do not claim
+
+**Did host gene expression change from pre to post? Yes, in both arms.**
+The transcriptome-wide test is significant in both arms (though the effect
+is small: R² = 0.7–1.0%), and hundreds of individual genes change in each
+arm — 812 in the probiotic arm, 233 in placebo, mostly small changes.
+
+**Differently by arm? In amount, no; in which genes, mostly yes; in
+direction, only barely.**
+
+- The *size* of the within-person expression shift is identical in the two
+  arms (Aitchison 71.9 vs 70.9, p = 0.55) — unlike the bacteria, where the
+  probiotic arm moved further.
+- The *significant-gene lists* barely overlap (37 genes shared of 812/233),
+  but significance is partly a power artefact: the probiotic arm is bigger
+  (120 vs 55 participants), so it detects smaller changes.
+- The *formal arm contrast* finds only 5 genes, of which the interpretable
+  pattern is an interferon-response programme (CXCL10, OAS2, STAT1) that
+  **rose in placebo and not in probiotic**. We present this as *suggestive,
+  not established*: nothing survives padj < 0.01, we tested 14,217 genes,
+  and we have no untreated control to say what the placebo arm would have
+  done anyway.
+
+Two claims we deliberately do not make. We do not say any gene "went up"
+in absolute terms: like the species table, the gene table is **compositional**
+— RNA-seq measures each gene's share of a fixed-size library, so a log
+fold-change means "a larger share of the sample's output". And we do not
+yet connect the host response to the bacterial shift or to symptoms — that
+is the multi-omics integration the workshop has been building towards.
+
+## Check it yourself
+
+- **The order check:** shuffle it and watch it stop —
+  `colnames(gk) <- sample(colnames(gk))` before the `stopifnot` line
+  crashes the chunk. This is the bug the workshop warns about, caught.
+- **The DE counts:** `sum(res_all$probiotic$res$padj < 0.05, na.rm = TRUE)`
+  should be 812, placebo 233. If your filter changed (`rowSums(gk >= 10) >= 35`),
+  your numbers will differ from ours — that is the point of listing it.
+- **A top gene:** recompute DMBT1's direction by eye —
+  `plotCounts(res_all$probiotic$dds, "ENSG00000187908", intgroup = "time_point")`.
+  The post points should sit lower than pre.
+- **The interaction:** redo CXCL10's z by hand from the two results
+  tables: LFCs −0.24 (probiotic) and +0.94 (placebo), standard errors in
+  `lfcSE`. You should get padj ≈ 0.026.
+- **The runtime claim:** time the DESeq2 chunk on a re-render — with the
+  cache warm it should be seconds, not minutes.
+
+## Choices made
+
+- **Same 175 participants as the community document (A116 dropped)** —
+  alternative: keep A116 here, since its RNA-seq is healthy (10.7M/12.6M
+  reads), giving 176 participants; we chose the shared population so the
+  two documents describe the same people.
+- **Gene filter: ≥10 counts in ≥10% of samples (14,217 of 14,226)** —
+  alternative: no filter; zeros distort the Aitchison distance, though for
+  host RNA-seq (expressed nearly everywhere) it barely bites either way.
+- **Aitchison distance via microViz's built-in `dist_calc("aitchison")`** —
+  alternative: Bray-Curtis on compositional data (dominated by the most
+  abundant genes) or robust Aitchison (ignores genes absent in either of a
+  compared pair).
+- **PERMANOVA per arm with `strata = participant_id`, 999 permutations** —
+  alternative: one pooled PERMANOVA ignoring the pairing, which inflates
+  significance.
+- **DESeq2 on raw counts, fit separately per arm, design
+  `~ participant + time`** — alternative: one combined model with a
+  time×arm interaction term, equivalent information at the cost of a
+  bigger fit.
+- **Arm contrast by z test on the two arms' LFCs, BH-corrected** —
+  alternative: the formal DESeq2 interaction coefficient; the z test uses
+  the same estimates and is instant, at the cost of the approximation.
+- **Batch left out of the design** (verified: both visits of every
+  participant are in the same RNA-seq batch, so `participant` absorbs it) —
+  alternative: an explicit `rnaseq_batch` column, unidentifiable next to
+  `participant`.
+- **Significance called at padj < 0.05 (BH), also reporting padj < 0.01
+  and |LFC| > 0.5** — alternative: a single threshold, which would have
+  hidden how modest most fold-changes are.
+- **Top genes ranked by padj, unshrunk LFCs** — alternative: shrunken LFCs
+  (`lfcShrink`), which are more stable but slower and less familiar.
+- **Cached the DESeq2 chunk (first render ≈ 30 minutes)** — alternative:
+  no cache and a painful re-render every edit.
